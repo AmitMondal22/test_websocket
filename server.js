@@ -2,6 +2,8 @@ require('dotenv').config();
 
 const path = require('path');
 const fs = require('fs');
+const http = require('http');
+const https = require('https');
 const fastify = require('fastify')({ logger: true });
 const fastifyStatic = require('@fastify/static');
 const fastifyWebsocket = require('@fastify/websocket');
@@ -65,7 +67,9 @@ function getAugmentedDevices() {
     return {
       ...dev,
       status: cam ? 'online' : 'offline',
-      streamUrl: cam ? cam.streamUrl : null
+      rawStreamUrl: cam ? cam.streamUrl : null,
+      streamUrl: cam ? `/camera/${dev.id}` : null,
+      proxyUrl: `/camera/${dev.id}`
     };
   });
 }
@@ -79,6 +83,80 @@ function broadcastToViewers(message) {
     }
   }
 }
+
+// Stream proxy handler helper
+function handleCameraStreamProxy(deviceId, request, reply) {
+  const cam = cameras.get(deviceId);
+
+  if (!cam || !cam.streamUrl) {
+    const devices = readDevices();
+    const dev = devices.find(d => d.id === deviceId);
+    if (dev) {
+      return reply.code(503).send({
+        status: 'error',
+        code: 'CAMERA_OFFLINE',
+        message: `Camera '${deviceId}' (${dev.name}) is currently offline.`
+      });
+    }
+    return reply.code(404).send({
+      status: 'error',
+      code: 'CAMERA_NOT_FOUND',
+      message: `Camera '${deviceId}' does not exist.`
+    });
+  }
+
+  const client = cam.streamUrl.startsWith('https') ? https : http;
+
+  return new Promise((resolve) => {
+    const proxyReq = client.get(cam.streamUrl, (camRes) => {
+      reply.raw.writeHead(camRes.statusCode, camRes.headers);
+      camRes.pipe(reply.raw);
+
+      camRes.on('end', () => resolve());
+      camRes.on('error', (err) => {
+        fastify.log.error(`Proxy stream error for camera ${deviceId}:`, err);
+        resolve();
+      });
+    });
+
+    proxyReq.on('error', (err) => {
+      fastify.log.error(`Failed to connect to camera ${deviceId} at ${cam.streamUrl}:`, err);
+      if (!reply.raw.headersSent) {
+        reply.code(502).send({
+          status: 'error',
+          code: 'CAMERA_STREAM_UNREACHABLE',
+          message: `Unable to connect to camera stream at ${cam.streamUrl}`
+        });
+      }
+      resolve();
+    });
+
+    request.raw.on('close', () => {
+      proxyReq.destroy();
+    });
+  });
+}
+
+// REST Endpoint: Proxy live camera stream directly via /camera/:deviceId
+fastify.get('/camera/:deviceId', async (request, reply) => {
+  return handleCameraStreamProxy(request.params.deviceId, request, reply);
+});
+
+// REST Endpoint: Explicit proxy stream route /camera/:deviceId/stream
+fastify.get('/camera/:deviceId/stream', async (request, reply) => {
+  return handleCameraStreamProxy(request.params.deviceId, request, reply);
+});
+
+// REST Endpoint: Get single device details
+fastify.get('/camera/:deviceId/info', async (request, reply) => {
+  const { deviceId } = request.params;
+  const devices = getAugmentedDevices();
+  const dev = devices.find(d => d.id === deviceId);
+  if (!dev) {
+    return reply.code(404).send({ status: 'error', message: `Camera '${deviceId}' not found.` });
+  }
+  return dev;
+});
 
 // REST Endpoint: Get all devices
 fastify.get('/api/devices', async (request, reply) => {
