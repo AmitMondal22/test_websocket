@@ -50,6 +50,15 @@ const viewers = new Map();
 const socketToDevice = new Map(); // socket -> deviceId
 const socketToViewer = new Map(); // socket -> viewerId
 
+// Helper to clean IPv6 mapped addresses (e.g., ::ffff:192.168.0.108 -> 192.168.0.108)
+function getCleanIp(rawIp) {
+  if (!rawIp) return null;
+  if (rawIp.startsWith('::ffff:')) {
+    return rawIp.substring(7);
+  }
+  return rawIp;
+}
+
 // Serve static frontend files
 fastify.register(fastifyStatic, {
   root: path.join(__dirname, 'public'),
@@ -102,6 +111,15 @@ function handleCameraStreamProxy(deviceId, request, reply) {
       status: 'error',
       code: 'CAMERA_NOT_FOUND',
       message: `Camera '${deviceId}' does not exist.`
+    });
+  }
+
+  // Circular dependency protection (prevent server fetching from its own proxy route)
+  if (cam.streamUrl.includes(`/camera/${deviceId}`) || cam.streamUrl.includes(`:${PORT}/camera/`)) {
+    return reply.code(500).send({
+      status: 'error',
+      code: 'CIRCULAR_PROXY_ERROR',
+      message: `Camera '${deviceId}' registered a self-referential streamUrl (${cam.streamUrl}). Please configure ESP32 to register its local IP stream URL (e.g. http://192.168.0.108:81/stream).`
     });
   }
 
@@ -175,20 +193,41 @@ fastify.register(async function (fastifyInstance) {
 
           // ─── ESP32-CAM registers itself ───
           case 'register-camera': {
-            const { deviceId, name, streamUrl } = message;
-            if (!deviceId || !name || !streamUrl) {
+            const { deviceId, name, streamUrl, localUrl } = message;
+            if (!deviceId || !name) {
               socket.send(JSON.stringify({
                 type: 'error',
-                message: 'Missing required fields: deviceId, name, streamUrl'
+                message: 'Missing required fields: deviceId, name'
               }));
               return;
             }
 
-            // Register camera in memory with its MJPEG stream URL
+            const rawRemoteIp = req.socket?.remoteAddress || req.headers?.['x-forwarded-for'];
+            const clientIp = getCleanIp(rawRemoteIp);
+
+            // Determine target stream URL (where server fetches MJPEG from physical ESP32)
+            let targetStreamUrl = localUrl || streamUrl;
+
+            // Detect if streamUrl is self-referential (pointing back to this server's /camera/ route)
+            const isSelfReferential = targetStreamUrl && (
+              targetStreamUrl.includes(`/camera/${deviceId}`) ||
+              targetStreamUrl.includes(`:${PORT}`)
+            );
+
+            if (!targetStreamUrl || isSelfReferential) {
+              if (clientIp) {
+                targetStreamUrl = `http://${clientIp}:81/stream`;
+                fastify.log.warn(`Self-referential or missing streamUrl detected for camera ${deviceId}. Auto-resolved target stream URL to: ${targetStreamUrl}`);
+              }
+            }
+
+            // Register camera in memory with resolved target MJPEG stream URL
             cameras.set(deviceId, {
               socket,
               name,
-              streamUrl,
+              streamUrl: targetStreamUrl,
+              registeredStreamUrl: streamUrl,
+              clientIp,
               lastSeen: new Date().toISOString()
             });
             socketToDevice.set(socket, deviceId);
