@@ -1,3 +1,5 @@
+require('dotenv').config();
+
 const path = require('path');
 const fs = require('fs');
 const fastify = require('fastify')({ logger: true });
@@ -5,7 +7,12 @@ const fastifyStatic = require('@fastify/static');
 const fastifyWebsocket = require('@fastify/websocket');
 const { v4: uuidv4 } = require('uuid');
 
-const DEVICES_FILE = path.join(__dirname, 'devices.json');
+const PORT = parseInt(process.env.PORT, 10) || 3000;
+const HOST = process.env.HOST || '0.0.0.0';
+const DEVICES_FILE = process.env.DEVICES_FILE
+  ? path.resolve(__dirname, process.env.DEVICES_FILE)
+  : path.join(__dirname, 'devices.json');
+
 
 // Helper to read devices from JSON file
 function readDevices() {
@@ -192,8 +199,8 @@ fastify.register(async function (fastifyInstance) {
 // Start the server
 const start = async () => {
   try {
-    await fastify.listen({ port: 3000, host: '0.0.0.0' });
-    fastify.log.info(`Server is listening on http://localhost:3000`);
+    await fastify.listen({ port: PORT, host: HOST });
+    fastify.log.info(`Server is listening on http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}`);
   } catch (err) {
     fastify.log.error(err);
     process.exit(1);
