@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>ESP32-CAM Streaming Dashboard</title>
-  <meta name="description" content="Live streaming dashboard for ESP32-CAM devices over HTTP MJPEG">
+  <meta name="description" content="Live streaming dashboard for ESP32-CAM devices over WebSocket binary relay">
   <!-- Bootstrap 5 CSS -->
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
   <!-- FontAwesome Icons -->
@@ -41,7 +41,7 @@
               </h4>
               <small class="text-secondary font-monospace" id="current-stream-id">ID: -</small>
               <br>
-              <small class="text-secondary font-monospace" id="stream-url-display"></small>
+              <small class="text-secondary font-monospace" id="stream-fps-display"></small>
             </div>
             <button class="btn btn-danger btn-sm" id="btn-close-stream">
               <i class="fa-solid fa-square-xmark me-1"></i>Close Stream
@@ -53,12 +53,11 @@
               <span class="pulse-indicator"></span>
               <span>LIVE TRANSMISSION</span>
             </div>
-            <img id="remote-stream"
-                 style="display: none; width: 100%; height: 100%; object-fit: contain; border-radius: 8px;"
-                 alt="ESP32-CAM Live Stream" />
-            <div class="d-none text-center py-5" id="stream-error">
-              <i class="fa-solid fa-triangle-exclamation fa-2x text-warning mb-2"></i>
-              <p class="text-secondary">Could not load stream. Ensure the ESP32-CAM is reachable on your network.</p>
+            <canvas id="remote-stream"
+                    style="display: none; width: 100%; height: 100%; object-fit: contain; border-radius: 8px;"></canvas>
+            <div class="d-none text-center py-5" id="stream-placeholder">
+              <i class="fa-solid fa-satellite-dish fa-2x text-violet mb-2"></i>
+              <p class="text-secondary">Waiting for frames from ESP32...</p>
             </div>
           </div>
         </div>

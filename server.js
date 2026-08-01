@@ -2,8 +2,6 @@ require('dotenv').config();
 
 const path = require('path');
 const fs = require('fs');
-const http = require('http');
-const https = require('https');
 const fastify = require('fastify')({ logger: true });
 const fastifyStatic = require('@fastify/static');
 const fastifyWebsocket = require('@fastify/websocket');
@@ -11,12 +9,12 @@ const { v4: uuidv4 } = require('uuid');
 
 const PORT = parseInt(process.env.PORT, 10) || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
-const DEVICES_FILE = process.env.DEVICES_FILE
-  ? path.resolve(__dirname, process.env.DEVICES_FILE)
-  : path.join(__dirname, 'devices.json');
+const DEVICES_FILE = path.join(__dirname, 'devices.json');
 
+// ════════════════════════════════════════════════════════════
+//  Persistent Device Storage (JSON file)
+// ════════════════════════════════════════════════════════════
 
-// Helper to read devices from JSON file
 function readDevices() {
   try {
     if (!fs.existsSync(DEVICES_FILE)) {
@@ -31,7 +29,6 @@ function readDevices() {
   }
 }
 
-// Helper to write devices to JSON file
 function writeDevices(devices) {
   try {
     fs.writeFileSync(DEVICES_FILE, JSON.stringify(devices, null, 2));
@@ -40,160 +37,111 @@ function writeDevices(devices) {
   }
 }
 
-// In-memory mapping of active connections
-// deviceId -> { socket, name, streamUrl, lastSeen }
+// ════════════════════════════════════════════════════════════
+//  In-Memory Connection Registries
+// ════════════════════════════════════════════════════════════
+
+// deviceId -> { socket, name, lastSeen }
 const cameras = new Map();
-// viewerId -> { socket }
+
+// viewerId -> { socket, watchingCameraId }
 const viewers = new Map();
 
-// Reverse lookups for cleanup
+// Reverse lookups for cleanup on disconnect
 const socketToDevice = new Map(); // socket -> deviceId
 const socketToViewer = new Map(); // socket -> viewerId
 
-// Helper to clean IPv6 mapped addresses (e.g., ::ffff:192.168.0.108 -> 192.168.0.108)
-function getCleanIp(rawIp) {
-  if (!rawIp) return null;
-  if (rawIp.startsWith('::ffff:')) {
-    return rawIp.substring(7);
-  }
-  return rawIp;
-}
+// ════════════════════════════════════════════════════════════
+//  Helper Functions
+// ════════════════════════════════════════════════════════════
 
-// Serve static frontend files
-fastify.register(fastifyStatic, {
-  root: path.join(__dirname, 'public'),
-  prefix: '/',
-});
-
-// Register websocket support
-fastify.register(fastifyWebsocket);
-
-// Helper to get devices list with live status and stream URLs
+// Get augmented device list with live online/offline status
 function getAugmentedDevices() {
   const devices = readDevices();
-  return devices.map(dev => {
-    const cam = cameras.get(dev.id);
-    return {
-      ...dev,
-      status: cam ? 'online' : 'offline',
-      rawStreamUrl: cam ? cam.streamUrl : null,
-      streamUrl: cam ? `/camera/${dev.id}` : null,
-      proxyUrl: `/camera/${dev.id}`
-    };
-  });
+  return devices.map(dev => ({
+    ...dev,
+    status: cameras.has(dev.id) ? 'online' : 'offline'
+  }));
 }
 
-// Helper to broadcast JSON messages to all registered viewers
+// Broadcast a JSON message to ALL registered viewers
 function broadcastToViewers(message) {
   const payload = JSON.stringify(message);
-  for (const [viewerId, viewer] of viewers.entries()) {
-    if (viewer.socket.readyState === 1) { // OPEN
+  for (const [, viewer] of viewers.entries()) {
+    if (viewer.socket.readyState === 1) {
       viewer.socket.send(payload);
     }
   }
 }
 
-// Stream proxy handler helper
-function handleCameraStreamProxy(deviceId, request, reply) {
-  const cam = cameras.get(deviceId);
-
-  if (!cam || !cam.streamUrl) {
-    const devices = readDevices();
-    const dev = devices.find(d => d.id === deviceId);
-    if (dev) {
-      return reply.code(503).send({
-        status: 'error',
-        code: 'CAMERA_OFFLINE',
-        message: `Camera '${deviceId}' (${dev.name}) is currently offline.`
-      });
+// Get all viewer IDs currently watching a specific camera
+function getViewersWatching(cameraId) {
+  const result = [];
+  for (const [viewerId, viewer] of viewers.entries()) {
+    if (viewer.watchingCameraId === cameraId) {
+      result.push({ viewerId, socket: viewer.socket });
     }
-    return reply.code(404).send({
-      status: 'error',
-      code: 'CAMERA_NOT_FOUND',
-      message: `Camera '${deviceId}' does not exist.`
-    });
   }
-
-  // Circular dependency protection (prevent server fetching from its own proxy route)
-  if (cam.streamUrl.includes(`/camera/${deviceId}`) || cam.streamUrl.includes(`:${PORT}/camera/`)) {
-    return reply.code(500).send({
-      status: 'error',
-      code: 'CIRCULAR_PROXY_ERROR',
-      message: `Camera '${deviceId}' registered a self-referential streamUrl (${cam.streamUrl}). Please configure ESP32 to register its local IP stream URL (e.g. http://192.168.0.108:81/stream).`
-    });
-  }
-
-  const client = cam.streamUrl.startsWith('https') ? https : http;
-
-  return new Promise((resolve) => {
-    const proxyReq = client.get(cam.streamUrl, (camRes) => {
-      reply.raw.writeHead(camRes.statusCode, camRes.headers);
-      camRes.pipe(reply.raw);
-
-      camRes.on('end', () => resolve());
-      camRes.on('error', (err) => {
-        fastify.log.error(`Proxy stream error for camera ${deviceId}:`, err);
-        resolve();
-      });
-    });
-
-    proxyReq.on('error', (err) => {
-      fastify.log.error(`Failed to connect to camera ${deviceId} at ${cam.streamUrl}:`, err);
-      if (!reply.raw.headersSent) {
-        reply.code(502).send({
-          status: 'error',
-          code: 'CAMERA_STREAM_UNREACHABLE',
-          message: `Unable to connect to camera stream at ${cam.streamUrl}`
-        });
-      }
-      resolve();
-    });
-
-    request.raw.on('close', () => {
-      proxyReq.destroy();
-    });
-  });
+  return result;
 }
 
-// REST Endpoint: Proxy live camera stream directly via /camera/:deviceId
-fastify.get('/camera/:deviceId', async (request, reply) => {
-  return handleCameraStreamProxy(request.params.deviceId, request, reply);
+// ════════════════════════════════════════════════════════════
+//  Static File Serving & Plugin Registration
+// ════════════════════════════════════════════════════════════
+
+fastify.register(fastifyStatic, {
+  root: path.join(__dirname, 'public'),
+  prefix: '/',
 });
 
-// REST Endpoint: Explicit proxy stream route /camera/:deviceId/stream
-fastify.get('/camera/:deviceId/stream', async (request, reply) => {
-  return handleCameraStreamProxy(request.params.deviceId, request, reply);
-});
+fastify.register(fastifyWebsocket);
 
-// REST Endpoint: Get single device details
-fastify.get('/camera/:deviceId/info', async (request, reply) => {
-  const { deviceId } = request.params;
-  const devices = getAugmentedDevices();
-  const dev = devices.find(d => d.id === deviceId);
-  if (!dev) {
-    return reply.code(404).send({ status: 'error', message: `Camera '${deviceId}' not found.` });
-  }
-  return dev;
-});
+// ════════════════════════════════════════════════════════════
+//  REST API
+// ════════════════════════════════════════════════════════════
 
-// REST Endpoint: Get all devices
-fastify.get('/api/devices', async (request, reply) => {
+fastify.get('/api/devices', async () => {
   return getAugmentedDevices();
 });
 
-// WebSocket route - signaling only (no binary frames)
+// ════════════════════════════════════════════════════════════
+//  WebSocket Route — Signaling + Binary Frame Relay
+// ════════════════════════════════════════════════════════════
+
 fastify.register(async function (fastifyInstance) {
   fastifyInstance.get('/ws', { websocket: true }, (socket, req) => {
 
-    socket.on('message', (rawData) => {
+    // ── Handle incoming messages (text = JSON signaling, binary = camera frames) ──
+    socket.on('message', (rawData, isBinary) => {
+
+      // ────────────────────────────────────────────
+      //  BINARY: Camera sending a JPEG frame
+      // ────────────────────────────────────────────
+      if (isBinary) {
+        const deviceId = socketToDevice.get(socket);
+        if (!deviceId) return; // Not a registered camera
+
+        // Relay this frame to all viewers watching this camera
+        const watchers = getViewersWatching(deviceId);
+        for (const watcher of watchers) {
+          if (watcher.socket.readyState === 1) {
+            watcher.socket.send(rawData, { binary: true });
+          }
+        }
+        return;
+      }
+
+      // ────────────────────────────────────────────
+      //  TEXT: JSON signaling messages
+      // ────────────────────────────────────────────
       try {
         const message = JSON.parse(rawData.toString());
 
         switch (message.type) {
 
-          // ─── ESP32-CAM registers itself ───
+          // ─── ESP32 Camera Registration ───
           case 'register-camera': {
-            const { deviceId, name, streamUrl, localUrl } = message;
+            const { deviceId, name } = message;
             if (!deviceId || !name) {
               socket.send(JSON.stringify({
                 type: 'error',
@@ -202,43 +150,20 @@ fastify.register(async function (fastifyInstance) {
               return;
             }
 
-            const rawRemoteIp = req.socket?.remoteAddress || req.headers?.['x-forwarded-for'];
-            const clientIp = getCleanIp(rawRemoteIp);
-
-            // Determine target stream URL (where server fetches MJPEG from physical ESP32)
-            let targetStreamUrl = localUrl || streamUrl;
-
-            // Detect if streamUrl is self-referential (pointing back to this server's /camera/ route)
-            const isSelfReferential = targetStreamUrl && (
-              targetStreamUrl.includes(`/camera/${deviceId}`) ||
-              targetStreamUrl.includes(`:${PORT}`)
-            );
-
-            if (!targetStreamUrl || isSelfReferential) {
-              if (clientIp) {
-                targetStreamUrl = `http://${clientIp}:81/stream`;
-                fastify.log.warn(`Self-referential or missing streamUrl detected for camera ${deviceId}. Auto-resolved target stream URL to: ${targetStreamUrl}`);
-              }
-            }
-
-            // Register camera in memory with resolved target MJPEG stream URL
+            // Store in memory
             cameras.set(deviceId, {
               socket,
               name,
-              streamUrl: targetStreamUrl,
-              registeredStreamUrl: streamUrl,
-              clientIp,
               lastSeen: new Date().toISOString()
             });
             socketToDevice.set(socket, deviceId);
 
-            // Save to JSON storage
+            // Persist to JSON
             const devices = readDevices();
-            const existingIndex = devices.findIndex(d => d.id === deviceId);
-
-            if (existingIndex > -1) {
-              devices[existingIndex].name = name;
-              devices[existingIndex].lastActive = new Date().toISOString();
+            const idx = devices.findIndex(d => d.id === deviceId);
+            if (idx > -1) {
+              devices[idx].name = name;
+              devices[idx].lastActive = new Date().toISOString();
             } else {
               devices.push({
                 id: deviceId,
@@ -248,7 +173,7 @@ fastify.register(async function (fastifyInstance) {
             }
             writeDevices(devices);
 
-            fastify.log.info(`Camera registered: ${name} (${deviceId}) stream at ${streamUrl}`);
+            fastify.log.info(`Camera registered: ${name} (${deviceId})`);
 
             // Notify all viewers
             broadcastToViewers({
@@ -260,10 +185,10 @@ fastify.register(async function (fastifyInstance) {
             break;
           }
 
-          // ─── Browser viewer registers itself ───
+          // ─── Browser Viewer Registration ───
           case 'register-viewer': {
             const viewerId = uuidv4();
-            viewers.set(viewerId, { socket });
+            viewers.set(viewerId, { socket, watchingCameraId: null });
             socketToViewer.set(socket, viewerId);
 
             fastify.log.info(`Viewer connected: ${viewerId}`);
@@ -276,14 +201,70 @@ fastify.register(async function (fastifyInstance) {
             break;
           }
 
+          // ─── Viewer requests to watch a camera stream ───
+          case 'request-stream': {
+            const viewerId = socketToViewer.get(socket);
+            if (!viewerId) return;
+
+            const { targetCameraId } = message;
+            if (!targetCameraId) return;
+
+            const cam = cameras.get(targetCameraId);
+            if (!cam) {
+              socket.send(JSON.stringify({
+                type: 'stream-error',
+                message: `Camera '${targetCameraId}' is not online.`
+              }));
+              return;
+            }
+
+            // Subscribe this viewer to the camera
+            const viewer = viewers.get(viewerId);
+            if (viewer) {
+              viewer.watchingCameraId = targetCameraId;
+            }
+
+            fastify.log.info(`Viewer ${viewerId} started watching camera ${targetCameraId}`);
+
+            socket.send(JSON.stringify({
+              type: 'stream-started',
+              cameraId: targetCameraId,
+              cameraName: cam.name
+            }));
+            break;
+          }
+
+          // ─── Viewer stops watching ───
+          case 'stop-stream': {
+            const viewerId = socketToViewer.get(socket);
+            if (!viewerId) return;
+
+            const viewer = viewers.get(viewerId);
+            if (viewer) {
+              fastify.log.info(`Viewer ${viewerId} stopped watching camera ${viewer.watchingCameraId}`);
+              viewer.watchingCameraId = null;
+            }
+            break;
+          }
+
+          // ─── Camera heartbeat ───
+          case 'heartbeat': {
+            const { deviceId } = message;
+            if (deviceId && cameras.has(deviceId)) {
+              cameras.get(deviceId).lastSeen = new Date().toISOString();
+            }
+            break;
+          }
+
           default:
             fastify.log.warn(`Unknown message type: ${message.type}`);
         }
       } catch (err) {
-        fastify.log.error('Failed to parse incoming socket message:', err);
+        fastify.log.error('Failed to parse WebSocket message:', err);
       }
     });
 
+    // ── Handle disconnect ──
     socket.on('close', () => {
       // Camera disconnected
       if (socketToDevice.has(socket)) {
@@ -294,7 +275,19 @@ fastify.register(async function (fastifyInstance) {
 
         fastify.log.info(`Camera disconnected: ${cameraInfo?.name || deviceId}`);
 
-        // Notify all viewers
+        // Notify viewers watching this camera
+        for (const [viewerId, viewer] of viewers.entries()) {
+          if (viewer.watchingCameraId === deviceId && viewer.socket.readyState === 1) {
+            viewer.watchingCameraId = null;
+            viewer.socket.send(JSON.stringify({
+              type: 'stream-ended',
+              cameraId: deviceId,
+              reason: 'Camera disconnected'
+            }));
+          }
+        }
+
+        // Broadcast updated device list
         broadcastToViewers({
           type: 'devices-updated',
           devices: getAugmentedDevices()
@@ -306,14 +299,16 @@ fastify.register(async function (fastifyInstance) {
         const viewerId = socketToViewer.get(socket);
         viewers.delete(viewerId);
         socketToViewer.delete(socket);
-
         fastify.log.info(`Viewer disconnected: ${viewerId}`);
       }
     });
   });
 });
 
-// Start the server
+// ════════════════════════════════════════════════════════════
+//  Start Server
+// ════════════════════════════════════════════════════════════
+
 const start = async () => {
   try {
     await fastify.listen({ port: PORT, host: HOST });

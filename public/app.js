@@ -1,19 +1,72 @@
-// WebSocket connection for signaling only (device list updates)
+// ════════════════════════════════════════════════════════════
+//  ESP32-CAM WebSocket Binary Streaming — Viewer Dashboard
+// ════════════════════════════════════════════════════════════
+
 let ws = null;
 let viewerId = null;
 let currentCameraId = null;
-let currentStreamUrl = null;
 
-// Helper: Format ISO timestamp
+// FPS tracking
+let frameCount = 0;
+let lastFpsUpdate = 0;
+let currentFps = 0;
+
+// Canvas rendering
+const canvas = document.getElementById('remote-stream');
+const ctx = canvas.getContext('2d');
+
+// ════════════════════════════════════════════════════════════
+//  Helpers
+// ════════════════════════════════════════════════════════════
+
 function formatTime(isoString) {
   if (!isoString) return 'Never';
   const date = new Date(isoString);
   return date.toLocaleString();
 }
 
-// Connect to signaling server
+// Render a JPEG blob onto the canvas
+function renderFrame(blob) {
+  const url = URL.createObjectURL(blob);
+  const img = new Image();
+
+  img.onload = () => {
+    // Resize canvas to match frame dimensions (only if changed)
+    if (canvas.width !== img.width || canvas.height !== img.height) {
+      canvas.width = img.width;
+      canvas.height = img.height;
+    }
+
+    ctx.drawImage(img, 0, 0);
+    URL.revokeObjectURL(url);
+
+    // FPS counter
+    frameCount++;
+    const now = performance.now();
+    if (now - lastFpsUpdate >= 1000) {
+      currentFps = frameCount;
+      frameCount = 0;
+      lastFpsUpdate = now;
+      $('#stream-fps-display').text(`${currentFps} FPS`);
+    }
+  };
+
+  img.onerror = () => {
+    URL.revokeObjectURL(url);
+  };
+
+  img.src = url;
+}
+
+// ════════════════════════════════════════════════════════════
+//  WebSocket Connection
+// ════════════════════════════════════════════════════════════
+
 const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
 ws = new WebSocket(`${protocol}//${location.host}/ws`);
+
+// Receive binary frames as Blob
+ws.binaryType = 'blob';
 
 ws.onopen = () => {
   $('#server-status')
@@ -25,6 +78,18 @@ ws.onopen = () => {
 };
 
 ws.onmessage = (event) => {
+  // ── Binary frame from camera ──
+  if (event.data instanceof Blob) {
+    if (!currentCameraId) return; // Not watching anything
+
+    canvas.style.display = 'block';
+    $('#stream-placeholder').addClass('d-none');
+
+    renderFrame(event.data);
+    return;
+  }
+
+  // ── Text JSON signaling message ──
   try {
     const msg = JSON.parse(event.data);
 
@@ -39,7 +104,7 @@ ws.onmessage = (event) => {
         console.log('Devices list updated');
         renderDevicesGrid(msg.devices);
 
-        // If the camera we are watching went offline, close the stream
+        // If camera we are watching went offline, close stream
         if (currentCameraId) {
           const device = msg.devices.find(d => d.id === currentCameraId);
           if (!device || device.status !== 'online') {
@@ -47,6 +112,22 @@ ws.onmessage = (event) => {
             showToast('Camera went offline', 'warning');
           }
         }
+        break;
+
+      case 'stream-started':
+        console.log(`Stream started for camera: ${msg.cameraName}`);
+        showToast(`Watching: ${msg.cameraName}`, 'success');
+        break;
+
+      case 'stream-ended':
+        console.log(`Stream ended: ${msg.reason}`);
+        closeStream();
+        showToast(`Stream ended: ${msg.reason}`, 'warning');
+        break;
+
+      case 'stream-error':
+        console.error(`Stream error: ${msg.message}`);
+        showToast(msg.message, 'danger');
         break;
     }
   } catch (err) {
@@ -60,7 +141,10 @@ ws.onclose = () => {
     .removeClass('online').addClass('offline');
 };
 
-// Fetch devices from REST API
+// ════════════════════════════════════════════════════════════
+//  Device List
+// ════════════════════════════════════════════════════════════
+
 async function refreshDevicesList() {
   $('#devices-loading').removeClass('d-none');
   $('#devices-grid').find('.camera-card-col').remove();
@@ -75,7 +159,6 @@ async function refreshDevicesList() {
   }
 }
 
-// Render device cards
 function renderDevicesGrid(devices) {
   $('#devices-loading').addClass('d-none');
   $('#devices-grid').find('.camera-card-col').remove();
@@ -89,14 +172,23 @@ function renderDevicesGrid(devices) {
 
   devices.forEach(dev => {
     const isOnline = dev.status === 'online';
-    const buttonHtml = isOnline
-      ? `<button class="btn btn-primary-custom w-100 btn-watch"
-           data-id="${dev.id}" data-name="${dev.name}" data-stream="${dev.streamUrl || ''}">
+    const isWatching = currentCameraId === dev.id;
+
+    let buttonHtml;
+    if (isWatching) {
+      buttonHtml = `<button class="btn btn-danger w-100 btn-stop-watch" data-id="${dev.id}">
+          <i class="fa-solid fa-circle-stop me-1"></i>Stop Watching
+         </button>`;
+    } else if (isOnline) {
+      buttonHtml = `<button class="btn btn-primary-custom w-100 btn-watch"
+           data-id="${dev.id}" data-name="${dev.name}">
           <i class="fa-solid fa-circle-play me-1"></i>Watch Stream
-         </button>`
-      : `<button class="btn btn-secondary-custom w-100" disabled>
+         </button>`;
+    } else {
+      buttonHtml = `<button class="btn btn-secondary-custom w-100" disabled>
           <i class="fa-solid fa-video-slash me-1"></i>Offline
          </button>`;
+    }
 
     const card = $(`
       <div class="col camera-card-col">
@@ -129,57 +221,79 @@ function renderDevicesGrid(devices) {
   $('.btn-watch').off('click').on('click', function () {
     const id = $(this).data('id');
     const name = $(this).data('name');
-    const streamUrl = $(this).data('stream');
-    watchStream(id, name, streamUrl);
+    watchStream(id, name);
+  });
+
+  // Bind stop-watch button clicks
+  $('.btn-stop-watch').off('click').on('click', function () {
+    closeStream();
   });
 }
 
-// Start watching a camera's MJPEG stream
-function watchStream(cameraId, cameraName, streamUrl) {
+// ════════════════════════════════════════════════════════════
+//  Stream Control
+// ════════════════════════════════════════════════════════════
+
+function watchStream(cameraId, cameraName) {
   if (currentCameraId) {
     closeStream();
   }
 
-  if (!streamUrl) {
-    showToast('No stream URL available for this camera', 'danger');
-    return;
-  }
-
   currentCameraId = cameraId;
-  currentStreamUrl = streamUrl;
+
+  // Reset FPS tracking
+  frameCount = 0;
+  lastFpsUpdate = performance.now();
+  currentFps = 0;
 
   $('#current-stream-name').html(
     `<i class="fa-solid fa-video me-2 text-violet"></i>Live: ${cameraName}`
   );
   $('#current-stream-id').text(`ID: ${cameraId}`);
-  $('#stream-url-display').text(streamUrl);
+  $('#stream-fps-display').text('Connecting...');
 
-  // Set the <img> src to the ESP32-CAM's MJPEG stream URL
-  // The browser natively renders multipart/x-mixed-replace MJPEG streams in an <img> tag
-  const imgEl = document.getElementById('remote-stream');
-  imgEl.src = streamUrl;
-  imgEl.style.display = 'block';
-  $('#stream-error').addClass('d-none');
+  // Show placeholder until first frame arrives
+  canvas.style.display = 'none';
+  $('#stream-placeholder').removeClass('d-none');
 
   // Reveal viewport
   $('#stream-viewport-container').removeClass('d-none');
   $('html, body').animate({
     scrollTop: $('#stream-viewport-container').offset().top - 20
   }, 500);
+
+  // Tell server to start relaying frames
+  ws.send(JSON.stringify({
+    type: 'request-stream',
+    targetCameraId: cameraId
+  }));
+
+  // Re-render device list to show "Stop Watching" button
+  refreshDevicesList();
 }
 
-// Close the active stream
 function closeStream() {
-  const imgEl = document.getElementById('remote-stream');
-  imgEl.removeAttribute('src');
-  imgEl.style.display = 'none';
+  // Tell server to stop relaying frames
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'stop-stream' }));
+  }
+
+  canvas.style.display = 'none';
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
 
   $('#stream-viewport-container').addClass('d-none');
+  $('#stream-fps-display').text('');
+
   currentCameraId = null;
-  currentStreamUrl = null;
+
+  // Re-render device list to show "Watch Stream" button
+  refreshDevicesList();
 }
 
-// Simple toast notification
+// ════════════════════════════════════════════════════════════
+//  Toast Notifications
+// ════════════════════════════════════════════════════════════
+
 function showToast(message, type) {
   const toast = $(`
     <div class="toast-notification ${type}">
@@ -194,7 +308,10 @@ function showToast(message, type) {
   }, 4000);
 }
 
-// Bind UI Controls
+// ════════════════════════════════════════════════════════════
+//  UI Bindings
+// ════════════════════════════════════════════════════════════
+
 $('#btn-close-stream').on('click', () => closeStream());
 $('#btn-refresh-devices').on('click', () => refreshDevicesList());
 
